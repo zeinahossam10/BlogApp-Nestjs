@@ -1,7 +1,9 @@
-import { ConflictException, UnauthorizedException } from '@nestjs/common';
+import { ConflictException, NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import * as bcrypt from 'bcrypt';
+import { promises as fs } from 'node:fs';
+import { join } from 'node:path';
 import { JwtService } from '@nestjs/jwt';
 import { Repository } from 'typeorm';
 import { AuthService } from './auth.service';
@@ -70,5 +72,37 @@ describe('AuthService', () => {
     (bcrypt.compare as jest.Mock).mockResolvedValue(false);
     await expect(service.login({ email: 'a@example.com', password: 'wrong' })).rejects.toBeInstanceOf(UnauthorizedException);
     expect(jwt.sign).not.toHaveBeenCalled();
+  });
+
+  it('updates the image URL and returns the updated user without its password', async () => {
+    const user = { id: 'user-1', email: 'a@example.com', username: 'Writer', password: 'hash', imageUrl: null } as User;
+    const image = {
+      filename: 'new-image.png',
+      path: join(process.cwd(), 'uploads', 'new-image.png'),
+    } as Express.Multer.File;
+    users.findOne.mockResolvedValue(user);
+    users.save.mockResolvedValue(user);
+
+    const result = await service.updateProfileImage('user-1', 'user-1', image);
+
+    expect(user.imageUrl).toBe('/uploads/new-image.png');
+    expect(users.save).toHaveBeenCalledWith(user);
+    expect(result).toMatchObject({ id: 'user-1', imageUrl: '/uploads/new-image.png' });
+    expect(result).not.toHaveProperty('password');
+  });
+
+  it('removes the uploaded file and reports a missing user', async () => {
+    const unlink = jest.spyOn(fs, 'unlink').mockResolvedValue(undefined);
+    users.findOne.mockResolvedValue(null);
+    const image = {
+      filename: 'orphan.png',
+      path: join(process.cwd(), 'uploads', 'orphan.png'),
+    } as Express.Multer.File;
+
+    await expect(service.updateProfileImage('missing', 'missing', image)).rejects.toBeInstanceOf(NotFoundException);
+
+    expect(unlink).toHaveBeenCalledWith(image.path);
+    expect(users.save).not.toHaveBeenCalled();
+    unlink.mockRestore();
   });
 });

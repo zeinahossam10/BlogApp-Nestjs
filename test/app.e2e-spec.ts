@@ -1,16 +1,20 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { ValidationPipe } from '@nestjs/common';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 import { DataSource } from 'typeorm';
+import { promises as fs } from 'node:fs';
+import { basename, join } from 'node:path';
 import request from 'supertest';
-import { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
 import testDataSource from '../src/database/data-source';
+import { PROFILE_IMAGE_DIRECTORY } from '../src/auth/profile-image.constants';
 
 describe('Blog API (e2e)', () => {
-  let app: INestApplication<App>;
+  let app: NestExpressApplication;
   let db: DataSource;
   let schemaReady = false;
   let sequence = 0;
+  const uploadedImages = new Set<string>();
   const email = () => `e2e-${Date.now()}-${++sequence}@example.test`;
   const register = async (address: string, username: string) => {
     const response = await request(app.getHttpServer()).post('/auth/register').send({ email: address, username, password: 'secret123' }).expect(201);
@@ -24,7 +28,8 @@ describe('Blog API (e2e)', () => {
 
   beforeAll(async () => {
     const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
-    app = module.createNestApplication();
+    app = module.createNestApplication<NestExpressApplication>();
+    app.useStaticAssets(PROFILE_IMAGE_DIRECTORY, { prefix: '/uploads/' });
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
     await app.init();
     db = testDataSource;
@@ -39,11 +44,19 @@ describe('Blog API (e2e)', () => {
   });
 
   afterAll(async () => {
-    await app?.close();
-    if (schemaReady && db?.isInitialized) {
-      await db.query('TRUNCATE TABLE "post_likes", "comments", "posts", "users" CASCADE');
+    try {
+      await app?.close();
+      if (schemaReady && db?.isInitialized) {
+        await db.query('TRUNCATE TABLE "post_likes", "comments", "posts", "users" CASCADE');
+      }
+    } finally {
+      if (db?.isInitialized) await db.destroy();
+      await Promise.all(
+        [...uploadedImages].map((filename) =>
+          fs.unlink(join(PROFILE_IMAGE_DIRECTORY, filename)).catch(() => undefined),
+        ),
+      );
     }
-    if (db?.isInitialized) await db.destroy();
   });
 
   it('registers and logs in; rejects invalid credentials', async () => {
@@ -93,5 +106,96 @@ describe('Blog API (e2e)', () => {
     await request(app.getHttpServer()).delete(`/posts/${postId}/likes`).set('Authorization', `Bearer ${authorToken}`).expect(200);
     await request(app.getHttpServer()).get(`/posts/${postId}/likes`).expect(200).expect(({ body }) => expect(body.likesCount).toBe(0));
     await request(app.getHttpServer()).delete(`/posts/${postId}`).set('Authorization', `Bearer ${authorToken}`).expect(200);
+  });
+
+  it('validates, serves, and replaces an authenticated user profile image', async () => {
+    const address = email();
+    const user = await register(address, 'Image Writer');
+    const token = await login(address);
+    const endpoint = `/users/${user.id}/image`;
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/pWQAAAAASUVORK5CYII=',
+      'base64',
+    );
+
+    await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', Buffer.from('not an image'), {
+        filename: 'note.txt',
+        contentType: 'text/plain',
+      })
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', Buffer.from('fake png'), {
+        filename: 'fake.png',
+        contentType: 'image/png',
+      })
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', Buffer.alloc(5 * 1024 * 1024 + 1), {
+        filename: 'large.png',
+        contentType: 'image/png',
+      })
+      .expect(413);
+
+    const firstUpload = await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', png, { filename: 'avatar.png', contentType: 'image/png' })
+      .expect(200);
+    const firstUrl = firstUpload.body.imageUrl as string;
+    const firstFilename = basename(firstUrl);
+    uploadedImages.add(firstFilename);
+
+    expect(firstUrl).toMatch(/^\/uploads\/[0-9a-f-]{36}\.png$/i);
+    expect(firstUpload.body).not.toHaveProperty('password');
+    await request(app.getHttpServer()).get(firstUrl).expect(200);
+
+    const otherAddress = email();
+    await register(otherAddress, 'Another Writer');
+    const otherToken = await login(otherAddress);
+    await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${otherToken}`)
+      .attach('image', png, { filename: 'unauthorized.png', contentType: 'image/png' })
+      .expect(403);
+    await request(app.getHttpServer()).get(firstUrl).expect(200);
+
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    const replacement = await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', jpeg, { filename: 'replacement.jpeg', contentType: 'image/jpeg' })
+      .expect(200);
+    const replacementUrl = replacement.body.imageUrl as string;
+    uploadedImages.add(basename(replacementUrl));
+
+    await request(app.getHttpServer()).get(firstUrl).expect(404);
+    await request(app.getHttpServer()).get(replacementUrl).expect(200);
+
+    const webp = Buffer.from('RIFF0000WEBP');
+    const webpUpload = await request(app.getHttpServer())
+      .patch(endpoint)
+      .set('Authorization', `Bearer ${token}`)
+      .attach('image', webp, { filename: 'avatar.webp', contentType: 'image/webp' })
+      .expect(200);
+    const webpUrl = webpUpload.body.imageUrl as string;
+    uploadedImages.add(basename(webpUrl));
+
+    expect(webpUrl).toMatch(/^\/uploads\/[0-9a-f-]{36}\.webp$/i);
+    await request(app.getHttpServer()).get(replacementUrl).expect(404);
+    await request(app.getHttpServer()).get(webpUrl).expect(200);
   });
 });

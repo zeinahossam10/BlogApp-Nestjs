@@ -4,6 +4,8 @@ Agents.md
 /dist
 /node_modules
 /build
+/uploads/*
+!/uploads/.gitkeep
 
 # TypeScript build cache
 *.tsbuildinfo

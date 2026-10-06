@@ -1,10 +1,14 @@
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import { PROFILE_IMAGE_DIRECTORY } from './auth/profile-image.constants';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+
+  app.useStaticAssets(PROFILE_IMAGE_DIRECTORY, { prefix: '/uploads/' });
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -30,4 +34,4 @@ async function bootstrap() {
   await app.listen(3000);
 }
 
-bootstrap();
+void bootstrap();
